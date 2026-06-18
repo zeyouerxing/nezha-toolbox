@@ -1,13 +1,33 @@
 #!/bin/bash
-# 哪吒面板管理脚本（修正版）
-# 1-安装 | 2-备份与恢复 | 3-开启 TSDB | 0-退出
+# =============================================================================
+# 哪吒面板管理工具箱
+# 功能：安装、备份/恢复、开启 TSDB
+# 支持 curl ... | bash 一键执行
+# 仓库：https://github.com/zeyouerxing/nezha-toolbox
+# =============================================================================
 
 set -euo pipefail
+
+# ---------- 兼容管道执行（curl | bash） ----------
+if [ ! -t 0 ]; then
+    exec < /dev/tty
+fi
 
 # ---------- 全局日志函数 ----------
 log() { echo "[$(date '+%F %T')] $*"; }
 
-# ---------- 安装 ----------
+# ---------- 检测 docker compose 命令 ----------
+detect_compose_cmd() {
+    if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
+        echo "docker compose"
+    elif command -v docker-compose &>/dev/null; then
+        echo "docker-compose"
+    else
+        echo ""
+    fi
+}
+
+# ---------- 安装官方哪吒面板 ----------
 install_nezha() {
     log "开始执行官方安装脚本..."
     curl -L https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh -o /tmp/nezha.sh
@@ -20,12 +40,18 @@ install_nezha() {
 do_backup() {
     local BACKUP="/root/backup.tar.gz"
     local DB="/opt/nezha/dashboard/data/sqlite.db"
+    local COMPOSE_CMD
+    COMPOSE_CMD=$(detect_compose_cmd)
+    if [ -z "$COMPOSE_CMD" ]; then
+        log "错误：未找到 docker compose 或 docker-compose 命令，无法操作服务。"
+        return 1
+    fi
 
     log "1. 停止服务"
     systemctl stop nginx 2>/dev/null || true
     if [ -d /opt/nezha/dashboard ]; then
         cd /opt/nezha/dashboard
-        docker compose down || true
+        $COMPOSE_CMD down || true
     fi
 
     log "2. SQLite 安全处理（兼容 TSDB）"
@@ -41,8 +67,9 @@ do_backup() {
         fi
     fi
 
-    log "3. 创建备份"
+    log "3. 创建备份（忽略缺失目录）"
     tar -czvf "$BACKUP" \
+        --ignore-failed-read \
         --exclude="/opt/nezha/dashboard/data/tsdb" \
         --exclude="/opt/nezha/dashboard/data/*.log" \
         --exclude="/opt/nezha/dashboard/data/*.db-wal" \
@@ -51,21 +78,26 @@ do_backup() {
         --exclude="/opt/nezha/*.log" \
         /etc/nginx \
         /opt/nezha \
-        /root/ssl
+        /root/ssl 2>/dev/null || true
 
     log "4. 启动服务"
     if [ -d /opt/nezha/dashboard ]; then
         cd /opt/nezha/dashboard
-        docker compose up -d || true
+        $COMPOSE_CMD up -d || true
     fi
     systemctl start nginx 2>/dev/null || true
 
     log "5. 检查容器状态"
     sleep 5
-    if docker ps --filter "name=nezha" --filter "status=running" | grep -q "nezha"; then
-        log "容器运行正常"
+    if [ -d /opt/nezha/dashboard ]; then
+        cd /opt/nezha/dashboard
+        if $COMPOSE_CMD ps --status running | grep -q "Up"; then
+            log "容器运行正常"
+        else
+            log "容器未完全启动，请检查 $COMPOSE_CMD logs"
+        fi
     else
-        log "容器未运行或状态异常，请检查 docker compose logs"
+        log "哪吒面板目录不存在，跳过容器检查"
     fi
 
     log "完成备份: $BACKUP"
@@ -75,6 +107,13 @@ do_backup() {
 # ---------- 恢复 ----------
 do_restore() {
     local BACKUP="/root/backup.tar.gz"
+    local COMPOSE_CMD
+    COMPOSE_CMD=$(detect_compose_cmd)
+    if [ -z "$COMPOSE_CMD" ]; then
+        log "错误：未找到 docker compose 或 docker-compose 命令，无法操作服务。"
+        return 1
+    fi
+
     if [ ! -f "$BACKUP" ]; then
         log "错误：备份文件 $BACKUP 不存在，无法恢复。"
         return 1
@@ -91,26 +130,31 @@ do_restore() {
     systemctl stop nginx 2>/dev/null || true
     if [ -d /opt/nezha/dashboard ]; then
         cd /opt/nezha/dashboard
-        docker compose down || true
+        $COMPOSE_CMD down || true
     fi
 
     log "2. 恢复文件（覆盖方式）"
     cd /
-    tar -xzvf "$BACKUP" -C /
+    tar -xzvf "$BACKUP" -C / 2>/dev/null || true
 
     log "3. 启动服务"
     if [ -d /opt/nezha/dashboard ]; then
         cd /opt/nezha/dashboard
-        docker compose up -d || true
+        $COMPOSE_CMD up -d || true
     fi
     systemctl start nginx 2>/dev/null || true
 
     log "4. 检查容器状态"
     sleep 5
-    if docker ps --filter "name=nezha" --filter "status=running" | grep -q "nezha"; then
-        log "容器恢复后运行正常"
+    if [ -d /opt/nezha/dashboard ]; then
+        cd /opt/nezha/dashboard
+        if $COMPOSE_CMD ps --status running | grep -q "Up"; then
+            log "容器恢复后运行正常"
+        else
+            log "容器未完全启动，请检查 $COMPOSE_CMD logs"
+        fi
     else
-        log "容器未运行或状态异常，请检查 docker compose logs"
+        log "哪吒面板目录不存在，跳过容器检查"
     fi
 
     log "恢复完成（从 $BACKUP）"
@@ -135,7 +179,7 @@ backup_restore_menu() {
     esac
 }
 
-# ---------- 开启 TSDB（安全模式：不自动修改 YAML，仅检测并提示）----------
+# ---------- 开启 TSDB（安全模式：仅检测 + 手动指引）----------
 enable_tsdb() {
     local DASHBOARD_DIR="/opt/nezha/dashboard"
     local COMPOSE_FILE="$DASHBOARD_DIR/docker-compose.yml"
@@ -155,13 +199,12 @@ enable_tsdb() {
         log "检测到 config.yaml 中 tsdb: true，TSDB 已开启。"
     fi
 
-    # 2) 检查运行容器环境变量（更广泛匹配）
+    # 2) 检查运行容器环境变量（通过 docker inspect）
     if [ "$tsdb_enabled" = false ] && command -v docker &>/dev/null; then
-        # 查找所有可能包含哪吒面板的容器（按镜像名或容器名）
+        # 查找可能的容器名或镜像名
         local containers
         containers=$(docker ps --format '{{.Names}}' | grep -i nezha || true)
         if [ -z "$containers" ]; then
-            # 尝试通过镜像名查找
             containers=$(docker ps --filter "ancestor=ghcr.io/nezhahq/nezha-dashboard" --format '{{.Names}}' || true)
         fi
         for c in $containers; do
@@ -184,7 +227,13 @@ enable_tsdb() {
     echo "  environment:"
     echo "    - TSDB=true"
     log "然后执行以下命令："
-    echo "  cd $DASHBOARD_DIR && docker compose down && docker compose up -d"
+    local COMPOSE_CMD
+    COMPOSE_CMD=$(detect_compose_cmd)
+    if [ -n "$COMPOSE_CMD" ]; then
+        echo "  cd $DASHBOARD_DIR && $COMPOSE_CMD down && $COMPOSE_CMD up -d"
+    else
+        echo "  cd $DASHBOARD_DIR && docker compose down && docker compose up -d"
+    fi
     log "完成后可再次运行本选项以验证是否生效。"
     return 1
 }
@@ -204,12 +253,12 @@ show_menu() {
         1) install_nezha ;;
         2) backup_restore_menu ;;
         3) enable_tsdb ;;
-        0) echo "退出脚本。"; exit 0 ;;
+        0) log "退出脚本。"; exit 0 ;;
         *) echo "无效选项，请重新输入。" ;;
     esac
 }
 
-# 主循环
+# ---------- 主循环 ----------
 while true; do
     show_menu
     echo ""
