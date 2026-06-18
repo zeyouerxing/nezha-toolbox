@@ -44,7 +44,7 @@ confirm_action() {
     return 0
 }
 
-# ==================== 功能 1：优化版官方脚本调用 ====================
+# ==================== 功能 1：官方脚本调用 ====================
 run_official_script() {
     log "正在下载并调用哪吒面板官方安装脚本..."
 
@@ -56,21 +56,19 @@ run_official_script() {
     log "请直接输入数字选项并按回车"
     echo "──────────────────────────────────────────"
 
-    # 多种方式尝试，确保交互正常
     if command -v script >/dev/null 2>&1; then
         script -q -c "/tmp/nezha.sh" /dev/null
     elif [ -t 0 ]; then
         /tmp/nezha.sh
     else
-        # 最终兜底方案
         /tmp/nezha.sh </dev/tty || {
-            echo "当前环境交互受限，推荐使用以下命令单独运行官方脚本："
+            echo "交互模式受限，建议单独执行官方脚本："
             echo "bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install.sh)"
         }
     fi
 }
 
-# ==================== 功能 2 ====================
+# ==================== 功能 2：备份 ====================
 run_backup() {
     if [ ! -d "$NEZHA_DIR" ]; then
         log "错误: 未检测到哪吒面板安装目录 ($NEZHA_DIR)，无法执行备份。"
@@ -125,7 +123,7 @@ run_backup() {
     log "完成[${type_desc}]: $BACKUP"
 }
 
-# ==================== 功能 3 ====================
+# ==================== 功能 3：恢复 ====================
 run_restore() {
     if [ ! -f "$BACKUP" ]; then
         log "错误: 备份文件不存在: $BACKUP"
@@ -166,35 +164,49 @@ run_restore() {
     systemctl start nginx 2>/dev/null || true
 }
 
-# ==================== 功能 4 ====================
+# ==================== 功能 4：TSDB 开启（已修复） ====================
 enable_tsdb() {
     if [ ! -f "$CONFIG_FILE" ]; then
         log "错误: 未找到配置文件 ($CONFIG_FILE)"
         return 1
     fi
 
-    if grep -E -q "enabletsdb:\s*true" "$CONFIG_FILE"; then
+    # 更智能的检测（支持多种写法）
+    local tsdb_enabled=false
+    if grep -qiE 'enable(tsdb|_tsdb)\s*:\s*(true|on|yes|1)' "$CONFIG_FILE"; then
+        tsdb_enabled=true
+    fi
+
+    if [ "$tsdb_enabled" = true ]; then
         log "提示: TSDB 监控历史功能已经是【开启】状态，无需重复操作。"
+        echo "当前配置内容："
+        grep -iE 'enable.*tsdb' "$CONFIG_FILE" || echo "  (未找到相关配置)"
         return 0
     fi
 
     confirm_action "确定要修改配置并开启 TSDB (启用历史监控图表) 吗？" || return 0
 
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak" 2>/dev/null || true
+    # 备份原配置
+    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_$(date +%H%M%S)" || true
 
-    if grep -q "enabletsdb:" "$CONFIG_FILE"; then
-        sed -i 's/enabletsdb:.*/enabletsdb: true/' "$CONFIG_FILE"
+    # 修改或追加配置
+    if grep -qiE 'enable(tsdb|_tsdb)\s*:' "$CONFIG_FILE"; then
+        sed -i 's/enable[_]*tsdb\s*:.*/enabletsdb: true/i' "$CONFIG_FILE"
     else
         echo "" >> "$CONFIG_FILE"
+        echo "# TSDB 历史监控功能" >> "$CONFIG_FILE"
         echo "enabletsdb: true" >> "$CONFIG_FILE"
     fi
 
+    log "TSDB 已成功设置为开启状态。"
+
+    # 重启面板
     log "正在重启面板以应用配置..."
     if [ -d "/opt/nezha/dashboard" ]; then
         (cd /opt/nezha/dashboard && docker compose restart) || true
     fi
 
-    log "TSDB 配置已更新并重启完成。"
+    log "✅ TSDB 配置已更新并重启完成！"
 }
 
 # ==================== 菜单循环 ====================
@@ -202,7 +214,7 @@ show_menu() {
     while true; do
         clear
         echo "=========================================="
-        echo "       哪吒面板 自动化运维工具箱 v1.1       "
+        echo "       哪吒面板 自动化运维工具箱 v1.2       "
         echo "=========================================="
         echo " 1. 安装/管理 哪吒面板 (官方脚本)"
         echo " 2. 备份 哪吒面板数据 (精简/全量)"
