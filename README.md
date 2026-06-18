@@ -4,8 +4,6 @@ Nezha Toolbox
 
 集成官方脚本管理、数据备份与恢复、TSDB 开关等常用运维功能，支持一键运行。
 
-⸻
-
 功能列表
 
 * 安装/管理哪吒面板（官方脚本）
@@ -18,29 +16,29 @@ Nezha Toolbox
 使用方法
 
 一键运行（推荐）
-
+```bash
 curl -fsSL https://raw.githubusercontent.com/zeyouerxing/nezha-toolbox/main/nezha_tool.sh | bash
-
+```
 或
-
+```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zeyouerxing/nezha-toolbox/main/nezha_tool.sh)
-
+```
 ⸻
 
 本地运行
 
 下载脚本：
-
+```bash
 wget https://raw.githubusercontent.com/zeyouerxing/nezha-toolbox/main/nezha_tool.sh
-
+```
 赋予执行权限：
-
+```bash
 chmod +x nezha_tool.sh
-
+```
 运行：
-
+```bash
 bash nezha_tool.sh
-
+```
 ⸻
 
 主菜单
@@ -106,8 +104,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install
 * 执行压缩备份
 * 自动恢复服务运行
 
-⸻
-
 精简备份（推荐）
 
 不备份以下内容（存在时自动跳过）：
@@ -115,10 +111,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install
 * TSDB 历史数据
 * 日志文件
 * SQLite 临时文件
-
-适合日常迁移和定期备份。
-
-⸻
 
 全量备份
 
@@ -156,8 +148,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install
 
 自动回滚到恢复前状态
 
-无需手动干预。
-
 恢复完成后会自动：
 
 * 启动哪吒面板
@@ -189,7 +179,7 @@ enabletsdb: true
 
 恢复前安全快照：
 
-/root/before_restore_YYYY-MM-DD.tar.gz
+/ root/before_restore_YYYY-MM-DD.tar.gz
 
 TSDB 配置文件：
 
@@ -206,8 +196,6 @@ TSDB 配置文件：
 * 全量备份会保留 TSDB 历史数据（如果已开启）。
 * 如果未开启 TSDB，脚本会自动跳过对应目录，不影响备份和恢复。
 * 使用 curl | bash 运行时，如果官方脚本无法交互，可使用“输出官方命令”模式单独执行。
-
-⸻
 
 免责声明
 
