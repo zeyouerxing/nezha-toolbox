@@ -45,32 +45,13 @@
 
 ⸻
 
-## 🚀 一键运行（无需下载）
-
-### ✔ 推荐方式（通用 / GitHub 标准）
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zeyouerxing/nezha-toolbox/main/nezha_tool.sh | bash
-```
-
-- GitHub README 最常用写法
-- 兼容性最好
-- 无需 bash 特殊语法
-- 推荐优先使用
-
----
-
-### ✔ 备用方式（bash 专用，更稳定）
+## 🚀 一键运行
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/zeyouerxing/nezha-toolbox/main/nezha_tool.sh)
 ```
 
-- 依赖 bash（不支持 sh / dash）
-- 采用“临时文件执行”机制
-- 在部分复杂脚本场景更稳定
-- 作为备用执行方式使用
-⸻
+
 
 📋 使用说明
 
