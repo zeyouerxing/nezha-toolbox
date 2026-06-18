@@ -180,6 +180,12 @@ enable_tsdb() {
         return 1
     fi
 
+    # 状态检测：避免重复修改与重启
+    if grep -E -q "enabletsdb:\s*true" "$CONFIG_FILE"; then
+        log "提示: TSDB 监控历史功能已经是【开启】状态，无需重复操作。"
+        return 0
+    fi
+
     confirm_action "确定要修改配置并开启 TSDB (启用历史监控图表) 吗？" || return 0
 
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak" 2>/dev/null || true
