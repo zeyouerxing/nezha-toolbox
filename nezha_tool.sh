@@ -11,14 +11,15 @@ SNAP="/root/before_restore_${DATE}.tar.gz"
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
+# ==================== 核心兼容性修复 ====================
 safe_read() {
     local prompt="$1"
     local default="${2:-}"
     local var
 
-    # 临时关闭 set -e 防止 read 意外中断脚本
     set +e
-    read -r -p "$prompt" var
+    # </dev/tty 确保了即使在 curl | bash 环境下，也能正常接收键盘输入
+    read -r -p "$prompt" var </dev/tty
     set -e
     var="${var:-$default}"
     echo "$var"
@@ -52,7 +53,6 @@ run_official_script() {
     curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install.sh -o /tmp/nezha.sh
     chmod +x /tmp/nezha.sh
 
-    # 保证交互正常
     if command -v script >/dev/null 2>&1; then
         script -q -c "/tmp/nezha.sh" /dev/null
     else
@@ -110,10 +110,9 @@ run_backup() {
     systemctl stop nginx 2>/dev/null || true
     if [ -d "/opt/nezha/dashboard" ]; then
         (cd /opt/nezha/dashboard && docker compose down) || true
-        sleep 2 # 等待文件锁完全释放
+        sleep 2
     fi
 
-    # SQLite 优化
     if [ -f "$DB" ] && command -v sqlite3 >/dev/null 2>&1; then
         log "正在优化 SQLite 数据库..."
         sqlite3 "$DB" "PRAGMA wal_checkpoint(FULL);" || true
@@ -121,7 +120,6 @@ run_backup() {
     fi
 
     log "正在打包备份文件..."
-    # 注意：tar 打包绝对路径时，建议在 / 目录下执行，防止部分系统解压时报绝对路径警告
     cd /
     tar -czvf "$BACKUP" "${exclude_args[@]}" etc/nginx opt/nezha root/ssl || true
 
@@ -150,12 +148,10 @@ run_restore() {
         sleep 2
     fi
 
-    # 创建灾备快照
     cd /
     tar -czf "$SNAP" etc/nginx opt/nezha root/ssl 2>/dev/null || true
 
     log "正在清理旧数据并解压备份..."
-    # 核心修复：安全移走旧目录，防止解压时新旧文件混杂
     rm -rf /etc/nginx /opt/nezha /root/ssl
 
     if tar -xzf "$BACKUP" -C / --same-owner; then
@@ -188,11 +184,9 @@ enable_tsdb() {
 
     cp "$CONFIG_FILE" "${CONFIG_FILE}.bak" 2>/dev/null || true
 
-    # 修复拼写错误: 哪吒面板正确的配置项为 enabletsdb
     if grep -q "enabletsdb:" "$CONFIG_FILE"; then
         sed -i 's/enabletsdb:.*/enabletsdb: true/' "$CONFIG_FILE"
     else
-        # 换行追加，确保格式规范
         echo "" >> "$CONFIG_FILE"
         echo "enabletsdb: true" >> "$CONFIG_FILE"
     fi
@@ -236,6 +230,5 @@ show_menu() {
     done
 }
 
-# 进入主菜单循环
 clear
 show_menu
