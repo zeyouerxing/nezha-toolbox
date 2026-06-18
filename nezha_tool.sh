@@ -43,9 +43,24 @@ confirm_action() {
 }
 
 run_official_script() {
-    log "调用官方脚本..."
-    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o /tmp/nezha.sh
-    bash /tmp/nezha.sh
+    log "正在调用哪吒面板官方安装脚本..."
+
+    curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install.sh -o /tmp/nezha.sh
+    chmod +x /tmp/nezha.sh
+
+    # =========================
+    # 关键修复：强制伪终端执行
+    # =========================
+    if command -v script >/dev/null 2>&1; then
+        script -q -c "/tmp/nezha.sh" /dev/null
+    else
+        # fallback：强制绑定终端输入
+        if [ -t 0 ]; then
+            /tmp/nezha.sh
+        else
+            /tmp/nezha.sh </dev/tty || /tmp/nezha.sh
+        fi
+    fi
 }
 
 run_backup() {
@@ -122,6 +137,7 @@ enable_tsdb() {
 }
 
 show_menu() {
+    clear
     echo "=================================="
     echo "  哪吒面板工具箱"
     echo "=================================="
