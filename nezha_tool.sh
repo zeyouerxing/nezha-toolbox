@@ -18,7 +18,6 @@ safe_read() {
     local var
 
     set +e
-    # </dev/tty 确保了即使在 curl | bash 环境下，也能正常接收键盘输入
     read -r -p "$prompt" var </dev/tty
     set -e
     var="${var:-$default}"
@@ -42,25 +41,32 @@ confirm_action() {
         log "操作已取消。"
         return 1
     fi
-
     return 0
 }
 
-# ==================== 功能 1 ====================
+# ==================== 功能 1：优化版官方脚本调用 ====================
 run_official_script() {
-    log "正在调用哪吒面板官方安装脚本..."
+    log "正在下载并调用哪吒面板官方安装脚本..."
 
     curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install.sh -o /tmp/nezha.sh
     chmod +x /tmp/nezha.sh
 
+    echo "──────────────────────────────────────────"
+    log "即将进入【官方哪吒安装菜单】"
+    log "请直接输入数字选项并按回车"
+    echo "──────────────────────────────────────────"
+
+    # 多种方式尝试，确保交互正常
     if command -v script >/dev/null 2>&1; then
         script -q -c "/tmp/nezha.sh" /dev/null
+    elif [ -t 0 ]; then
+        /tmp/nezha.sh
     else
-        if [ -t 0 ]; then
-            /tmp/nezha.sh
-        else
-            /tmp/nezha.sh </dev/tty || /tmp/nezha.sh
-        fi
+        # 最终兜底方案
+        /tmp/nezha.sh </dev/tty || {
+            echo "当前环境交互受限，推荐使用以下命令单独运行官方脚本："
+            echo "bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/main/install.sh)"
+        }
     fi
 }
 
@@ -85,23 +91,10 @@ run_backup() {
 
     if [ "$backup_type" = "2" ]; then
         type_desc="全量备份"
-        exclude_args=(
-            --exclude="opt/nezha/dashboard/data/*.log"
-            --exclude="opt/nezha/dashboard/data/*.db-wal"
-            --exclude="opt/nezha/dashboard/data/*.db-shm"
-            --exclude="opt/nezha/dashboard/logs"
-            --exclude="opt/nezha/*.log"
-        )
+        exclude_args=(--exclude="opt/nezha/dashboard/data/*.log" --exclude="opt/nezha/dashboard/data/*.db-wal" --exclude="opt/nezha/dashboard/data/*.db-shm" --exclude="opt/nezha/dashboard/logs" --exclude="opt/nezha/*.log")
     else
         type_desc="精简备份"
-        exclude_args=(
-            --exclude="opt/nezha/dashboard/data/tsdb"
-            --exclude="opt/nezha/dashboard/data/*.log"
-            --exclude="opt/nezha/dashboard/data/*.db-wal"
-            --exclude="opt/nezha/dashboard/data/*.db-shm"
-            --exclude="opt/nezha/dashboard/logs"
-            --exclude="opt/nezha/*.log"
-        )
+        exclude_args=(--exclude="opt/nezha/dashboard/data/tsdb" --exclude="opt/nezha/dashboard/data/*.log" --exclude="opt/nezha/dashboard/data/*.db-wal" --exclude="opt/nezha/dashboard/data/*.db-shm" --exclude="opt/nezha/dashboard/logs" --exclude="opt/nezha/*.log")
     fi
 
     confirm_action "确定要开始哪吒面板的 [${type_desc}] 吗？" || return 0
@@ -180,7 +173,6 @@ enable_tsdb() {
         return 1
     fi
 
-    # 状态检测：避免重复修改与重启
     if grep -E -q "enabletsdb:\s*true" "$CONFIG_FILE"; then
         log "提示: TSDB 监控历史功能已经是【开启】状态，无需重复操作。"
         return 0
@@ -208,8 +200,9 @@ enable_tsdb() {
 # ==================== 菜单循环 ====================
 show_menu() {
     while true; do
+        clear
         echo "=========================================="
-        echo "       哪吒面板 自动化运维工具箱          "
+        echo "       哪吒面板 自动化运维工具箱 v1.1       "
         echo "=========================================="
         echo " 1. 安装/管理 哪吒面板 (官方脚本)"
         echo " 2. 备份 哪吒面板数据 (精简/全量)"
@@ -232,7 +225,6 @@ show_menu() {
         
         echo ""
         safe_read "按回车键返回主菜单..." ""
-        clear
     done
 }
 
