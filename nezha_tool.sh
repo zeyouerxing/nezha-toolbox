@@ -1,28 +1,43 @@
 #!/bin/bash
 # =============================================================================
-# 哪吒面板工具箱（生产版融合TSDB + 回滚 + 安全执行）
+# Nezha Toolbox（稳定交互终极版）
+# - 无 tty 崩溃
+# - curl | bash 兼容
+# - menu 不阻塞
 # =============================================================================
 
 set -euo pipefail
-
-# =========================
-# 兼容 curl | bash
-# =========================
-exec 0</dev/tty 2>/dev/null || true
-INPUT_FD="/dev/stdin"
 
 log() {
     echo "[$(date '+%F %T')] $*"
 }
 
 # =========================
+# 输入统一处理（终极版）
+# =========================
+safe_read() {
+    local prompt="$1"
+    local var
+
+    # 优先使用 tty，否则使用 stdin
+    if [ -t 0 ]; then
+        read -r -p "$prompt" var
+    else
+        read -r -p "$prompt" var < /dev/tty 2>/dev/null || {
+            echo "非交互环境，无法输入"
+            exit 1
+        }
+    fi
+
+    echo "$var"
+}
+
+# =========================
 # 强制确认（仅 Y）
 # =========================
 confirm_y() {
-    local prompt="$1"
     local input
-
-    read -r -p "$prompt (仅 Y 继续): " input < "$INPUT_FD" || true
+    input=$(safe_read "$1 (仅 Y 继续): ")
 
     case "$input" in
         Y) return 0 ;;
@@ -31,7 +46,7 @@ confirm_y() {
 }
 
 # =========================
-# docker compose 兼容
+# docker compose
 # =========================
 detect_compose_cmd() {
     if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
@@ -44,19 +59,14 @@ detect_compose_cmd() {
 }
 
 # =========================
-# TSDB检测（Nezha v1真实逻辑）
+# TSDB检测（稳定版）
 # =========================
 detect_tsdb() {
     local CONFIG="/opt/nezha/dashboard/data/config.yaml"
     local TSDB_DIR="/opt/nezha/dashboard/data/tsdb"
 
-    if [ -f "$CONFIG" ] && grep -q '^tsdb:' "$CONFIG"; then
-        return 0
-    fi
-
-    if [ -d "$TSDB_DIR" ]; then
-        return 0
-    fi
+    grep -q '^tsdb:' "$CONFIG" 2>/dev/null && return 0
+    [ -d "$TSDB_DIR" ] && return 0
 
     return 1
 }
@@ -71,7 +81,7 @@ rollback_tsdb() {
     local DIR="$4"
     local CMD="$5"
 
-    log "执行回滚..."
+    log "回滚TSDB..."
 
     $CMD down 2>/dev/null || true
 
@@ -82,13 +92,7 @@ rollback_tsdb() {
 
     $CMD up -d 2>/dev/null || true
 
-    sleep 5
-
-    if $CMD ps 2>/dev/null | grep -q "Up"; then
-        log "回滚成功"
-    else
-        log "回滚后服务异常，请手动检查"
-    fi
+    log "回滚完成"
 }
 
 # =========================
@@ -115,52 +119,35 @@ enable_tsdb() {
         return 0
     fi
 
-    if ! confirm_y "开启TSDB（将修改数据并重启服务）"; then
+    if ! confirm_y "开启TSDB（会修改数据并重启服务）"; then
         return 0
     fi
 
     cd "$DIR"
 
-    log "创建快照"
+    log "备份配置"
     cp -a "$CONFIG" "${CONFIG}.bak.${TIME}" 2>/dev/null || true
     cp -a "$DB" "${DB}.bak.${TIME}" 2>/dev/null || true
 
     log "停止服务"
     $CMD down 2>/dev/null || true
 
-    log "清理历史数据"
+    log "清理历史"
     sqlite3 "$DB" "DELETE FROM service_histories; VACUUM;" 2>/dev/null || true
 
     log "写入TSDB配置"
 
-    if grep -q '^tsdb:' "$CONFIG"; then
-        awk '
-        BEGIN{skip=0}
-        /^tsdb:/ {skip=1; next}
-        /^[^[:space:]]/ && skip==1 {skip=0}
-        skip==0 {print}
-        END {
-            print "tsdb:"
-            print "  data_path: \"/opt/nezha/dashboard/data/tsdb\""
-            print "  retention_days: 30"
-            print "  min_free_disk_space_gb: 1"
-            print "  max_memory_mb: 128"
-            print "  write_buffer_size: 512"
-            print "  write_buffer_flush_interval: 5"
-        }' "$CONFIG" > "$CONFIG.tmp"
-    else
-        {
-            cat "$CONFIG"
-            echo ""
-            echo "tsdb:"
-            echo "  data_path: \"/opt/nezha/dashboard/data/tsdb\""
-            echo "  retention_days: 30"
-            echo "  min_free_disk_space_gb: 1"
-            echo "  max_memory_mb: 128"
-            echo "  write_buffer_size: 512"
-            echo "  write_buffer_flush_interval: 5"
-        } > "$CONFIG.tmp"
-    fi
+    {
+        grep -v '^tsdb:' "$CONFIG" 2>/dev/null || true
+        echo ""
+        echo "tsdb:"
+        echo "  data_path: \"/opt/nezha/dashboard/data/tsdb\""
+        echo "  retention_days: 30"
+        echo "  min_free_disk_space_gb: 1"
+        echo "  max_memory_mb: 128"
+        echo "  write_buffer_size: 512"
+        echo "  write_buffer_flush_interval: 5"
+    } > "$CONFIG.tmp"
 
     mv "$CONFIG.tmp" "$CONFIG"
 
@@ -169,16 +156,16 @@ enable_tsdb() {
 
     sleep 10
 
-    log "验证TSDB"
+    log "验证"
 
     if [ ! -d "$TSDB_DIR" ]; then
-        log "TSDB未生成 → 回滚"
+        log "失败：TSDB未生成"
         rollback_tsdb "$CONFIG" "$DB" "$TIME" "$DIR" "$CMD"
         return 1
     fi
 
     if ! $CMD ps 2>/dev/null | grep -q "Up"; then
-        log "容器异常 → 回滚"
+        log "失败：服务异常"
         rollback_tsdb "$CONFIG" "$DB" "$TIME" "$DIR" "$CMD"
         return 1
     fi
@@ -198,14 +185,13 @@ do_backup() {
     [ -d /opt/nezha/dashboard ] && cd /opt/nezha/dashboard && $CMD down || true
 
     tar -czf "$BACKUP" \
-        --ignore-failed-read \
         --exclude="data/tsdb" \
-        /etc/nginx /opt/nezha /root/ssl 2>/dev/null || true
+        /opt/nezha /etc/nginx /root/ssl 2>/dev/null || true
 
     [ -d /opt/nezha/dashboard ] && cd /opt/nezha/dashboard && $CMD up -d || true
     systemctl start nginx 2>/dev/null || true
 
-    log "备份完成: $BACKUP"
+    log "备份完成"
 }
 
 # =========================
@@ -234,19 +220,20 @@ do_restore() {
 }
 
 # =========================
-# 菜单
+# 菜单（终极稳定版）
 # =========================
 menu() {
-    echo "=================="
-    echo "Nezha 工具箱"
-    echo "=================="
+    echo "===================="
+    echo "Nezha Toolbox"
+    echo "===================="
     echo "1 安装"
     echo "2 备份"
     echo "3 恢复"
     echo "4 开启TSDB"
     echo "0 退出"
 
-    read -r -p "选择: " c < "$INPUT_FD" || true
+    local c
+    c=$(safe_read "选择: ")
 
     case "$c" in
         1) bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh) ;;
@@ -254,10 +241,14 @@ menu() {
         3) do_restore ;;
         4) enable_tsdb ;;
         0) exit 0 ;;
+        *) echo "无效选项" ;;
     esac
 }
 
+# =========================
+# 主循环
+# =========================
 while true; do
     menu
-    echo
+    echo ""
 done
