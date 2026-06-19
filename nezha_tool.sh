@@ -86,11 +86,20 @@ tsdb_enabled() {
 
 # ---------- 核心功能函数 ----------
 
-# 安装 Nezha（不询问，直接执行）
+# 安装 Nezha（直接调用官方脚本，但增加提示与结果检测）
 install_nezha() {
-    print_info "正在调用官方脚本安装 Nezha..."
+    print_info "即将调用官方安装脚本（https://github.com/nezhahq/scripts）"
+    print_info "该脚本为交互式，请您根据提示完成安装（路径、域名、端口等设置）。"
+    print_info "安装完成后，请回到本菜单继续操作。"
+    echo ""
+    # 执行官方脚本
     bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh)
-    print_info "安装完成。"
+    # 检查安装结果
+    if nezha_installed; then
+        print_info "✅ Nezha 安装成功！"
+    else
+        print_error "❌ 安装未完成或已被取消，请检查上述输出。"
+    fi
 }
 
 # 备份
