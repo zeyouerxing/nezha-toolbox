@@ -1,176 +1,246 @@
 #!/bin/bash
-# =============================================================================
-# Nezha Toolbox - Final Production Stable Edition
-# 状态：Enterprise Stable / Runtime Accurate / No False State
-# =============================================================================
+# =====================================================
+# Nezha Toolbox - 生产版
+# 功能：安装、备份、恢复、开启 TSDB
+# 特性：严格错误处理、依赖检查、Root 权限要求
+# =====================================================
 
 set -euo pipefail
 
+# ---------- 全局变量 ----------
 BASE="/opt/nezha/dashboard"
 CONFIG="$BASE/data/config.yaml"
 DB="$BASE/data/sqlite.db"
+BACKUP_FILE="/root/backup.tar.gz"   # 固定名称（按需求保留）
 
-# =============================================================================
-# 日志
-# =============================================================================
-log() {
-    echo "[$(date '+%F %T')] $*"
+# ---------- 辅助函数 ----------
+
+# 打印带颜色的信息
+print_info()  { echo -e "\033[32m[INFO]\033[0m $*"; }
+print_warn()  { echo -e "\033[33m[WARN]\033[0m $*" >&2; }
+print_error() { echo -e "\033[31m[ERROR]\033[0m $*" >&2; }
+
+# 检查是否以 root 运行
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "此脚本需要 root 权限，请使用 sudo 运行。"
+        exit 1
+    fi
 }
 
-# =============================================================================
-# 输入层（安全TTY）
-# =============================================================================
+# 检查依赖命令是否存在
+check_deps() {
+    local deps=("docker" "tar" "sqlite3" "curl" "systemctl")
+    local missing=()
+    for cmd in "${deps[@]}"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        print_error "缺少以下依赖: ${missing[*]}，请安装后再试。"
+        exit 1
+    fi
+}
+
+# 安全输入函数（非交互环境返回空字符串，不退出）
 safe_input() {
     local prompt="$1"
-    local input
-
-    if [ -t 0 ] && [ -t 1 ]; then
-        read -r -p "$prompt" input
-        echo "$input"
-        return
+    local input=""
+    if [[ -t 0 ]]; then
+        read -r -p "$prompt" input || true
     fi
-
-    echo "非交互环境禁止执行"
-    exit 1
+    echo "$input"
 }
 
-# =============================================================================
-# 统一确认
-# =============================================================================
+# 确认函数（返回 0 表示 yes，1 表示 no）
 confirm() {
-    local v
-    v=$(echo "$(safe_input "$1 (y/n): ")" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
-
-    [[ "$v" == "y" || "$v" == "yes" ]]
+    local prompt="$1"
+    local answer
+    answer=$(safe_input "$prompt (y/n): ")
+    answer=$(echo "$answer" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+    [[ "$answer" == "y" || "$answer" == "yes" ]]
 }
 
-# =============================================================================
-# compose检测（强校验）
-# =============================================================================
+# 检测 docker compose 命令（优先 v2）
 detect_compose() {
-    if docker compose version >/dev/null 2>&1; then
+    if docker compose version &>/dev/null; then
         echo "docker compose"
-    elif command -v docker-compose >/dev/null 2>&1; then
+    elif docker-compose version &>/dev/null; then
         echo "docker-compose"
+    else
+        print_error "未找到 docker compose 或 docker-compose 命令，请确保 Docker 已安装。"
+        exit 1
     fi
 }
 
-require_compose() {
-    local c
-    c=$(detect_compose)
-
-    if [ -z "$c" ]; then
-        log "ERROR: docker compose 未安装"
-        return 1
-    fi
-
-    echo "$c"
-}
-
-# =============================================================================
-# Nezha状态
-# =============================================================================
+# 检查 Nezha 是否已安装（通过目录存在性）
 nezha_installed() {
-    [ -d "$BASE" ]
+    [[ -d "$BASE" ]]
 }
 
-# =============================================================================
-# TSDB 状态（真实运行态 = docker + config 双验证）
-# =============================================================================
-get_tsdb_state() {
+# 检查 TSDB 是否已启用（检查配置文件是否存在 tsdb: 行）
+tsdb_enabled() {
+    [[ -f "$CONFIG" ]] && grep -q '^tsdb:' "$CONFIG" 2>/dev/null
+}
+
+# ---------- 核心功能函数 ----------
+
+# 安装 Nezha
+install_nezha() {
+    if nezha_installed; then
+        print_warn "检测到已有安装目录 $BASE"
+        if ! confirm "是否继续执行官方安装脚本（可能覆盖配置）"; then
+            print_info "已取消安装。"
+            return 0
+        fi
+    fi
+    print_info "正在调用官方脚本安装 Nezha..."
+    bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh)
+    print_info "安装完成。"
+}
+
+# 备份
+do_backup() {
     local compose
     compose=$(detect_compose)
 
-    if ! nezha_installed; then
-        echo "UNKNOWN"
-        return
+    confirm "确认执行备份" || { print_info "已取消备份。"; return 0; }
+
+    print_info "开始备份..."
+
+    # 停止服务（允许失败）
+    systemctl stop nginx 2>/dev/null || print_warn "停止 nginx 失败（可能未运行）"
+    if [[ -d "$BASE" ]]; then
+        cd "$BASE"
+        $compose down 2>/dev/null || print_warn "停止容器失败（可能未运行）"
     fi
 
-    local config_ok=0
-    local runtime_ok=0
-
-    # 配置存在
-    if grep -q '^tsdb:' "$CONFIG" 2>/dev/null; then
-        config_ok=1
+    # 执行打包（严格检查）
+    print_info "正在打包数据..."
+    if ! tar -czvf "$BACKUP_FILE" \
+        --ignore-failed-read \
+        --exclude="/opt/nezha/dashboard/data/tsdb" \
+        --exclude="/opt/nezha/dashboard/data/*.log" \
+        --exclude="/opt/nezha/dashboard/data/*.db-wal" \
+        --exclude="/opt/nezha/dashboard/data/*.db-shm" \
+        --exclude="/opt/nezha/dashboard/logs" \
+        /etc/nginx /opt/nezha /root/ssl 2>&1; then
+        print_error "打包失败，请检查日志。"
+        exit 1
     fi
 
-    # 运行态必须来自 docker（关键修正点）
-    if [ -n "$compose" ]; then
-        if cd "$BASE" 2>/dev/null && $compose ps 2>/dev/null | grep -q "Up"; then
-            runtime_ok=1
-        fi
+    # 重启服务（允许失败）
+    if [[ -d "$BASE" ]]; then
+        cd "$BASE"
+        $compose up -d 2>/dev/null || print_warn "启动容器失败，请手动检查"
     fi
+    systemctl start nginx 2>/dev/null || print_warn "启动 nginx 失败，请手动检查"
 
-    if [ "$config_ok" -eq 1 ] && [ "$runtime_ok" -eq 1 ]; then
-        echo "ENABLED"
-    elif [ "$config_ok" -eq 1 ]; then
-        echo "CONFIG_ONLY"
-    else
-        echo "DISABLED"
-    fi
+    print_info "▶ 备份完成！文件保存在: $BACKUP_FILE"
 }
 
-# =============================================================================
-# TSDB 启用（不改业务逻辑，只增强稳定性）
-# =============================================================================
-enable_tsdb() {
+# 恢复
+do_restore() {
     local compose
-    compose=$(require_compose) || return 1
+    compose=$(detect_compose)
 
-    if ! nezha_installed; then
-        log "Nezha未安装"
-        return 1
-    fi
-
-    if ! confirm "确认开启TSDB（会重启服务）"; then
+    if [[ ! -f "$BACKUP_FILE" ]]; then
+        print_error "未找到备份文件 $BACKUP_FILE"
         return 0
     fi
 
-    local t
-    t=$(date +%F_%H-%M-%S)
+    confirm "确认执行恢复操作（将覆盖现有数据）" || { print_info "已取消恢复。"; return 0; }
 
-    cp -a "$CONFIG" "${CONFIG}.bak.${t}" 2>/dev/null || true
-    cp -a "$DB" "${DB}.bak.${t}" 2>/dev/null || true
+    print_info "开始恢复..."
 
-    $compose -f "$BASE/docker-compose.yml" down 2>/dev/null || true
+    # 停止服务（允许失败）
+    systemctl stop nginx 2>/dev/null || print_warn "停止 nginx 失败"
+    if [[ -d "$BASE" ]]; then
+        cd "$BASE"
+        $compose down 2>/dev/null || print_warn "停止容器失败"
+    fi
 
-    # 安全追加（避免破坏YAML结构）
+    # 解压（严格检查）
+    print_info "正在解压备份..."
+    if ! tar -xzvf "$BACKUP_FILE" -C / 2>&1; then
+        print_error "解压失败，请检查备份文件完整性。"
+        exit 1
+    fi
+
+    # 重启服务（允许失败）
+    if [[ -d "$BASE" ]]; then
+        cd "$BASE"
+        $compose up -d 2>/dev/null || print_warn "启动容器失败，请手动检查"
+    fi
+    systemctl start nginx 2>/dev/null || print_warn "启动 nginx 失败，请手动检查"
+
+    print_info "▶ 恢复完成！"
+}
+
+# 开启 TSDB
+enable_tsdb() {
+    local compose
+    compose=$(detect_compose)
+
+    if tsdb_enabled; then
+        print_info "TSDB 已经开启，无需重复操作。"
+        return 0
+    fi
+
+    confirm "确认开启 TSDB？（将清理 service_histories 历史记录）" || { print_info "已取消。"; return 0; }
+
+    print_info "正在配置 TSDB..."
+
+    # 停止服务（允许失败）
+    if [[ -d "$BASE" ]]; then
+        cd "$BASE"
+        $compose down 2>/dev/null || print_warn "停止容器失败"
+    fi
+
+    # 清理 SQLite 历史数据（仅当数据库存在）
+    if [[ -f "$DB" ]]; then
+        print_info "正在清理 SQLite 历史数据..."
+        if ! sqlite3 "$DB" "DELETE FROM service_histories; VACUUM;" 2>&1; then
+            print_error "SQLite 操作失败，请检查数据库文件。"
+            exit 1
+        fi
+    else
+        print_warn "数据库文件不存在，跳过清理。"
+    fi
+
+    # 追加 TSDB 配置（严格判断避免重复）
     if ! grep -q '^tsdb:' "$CONFIG" 2>/dev/null; then
-        cat >> "$CONFIG" <<EOF
+        print_info "正在写入 TSDB 配置..."
+        cat >> "$CONFIG" <<'EOF'
 
 tsdb:
-  data_path: "$BASE/data/tsdb"
+  data_path: "/opt/nezha/dashboard/data/tsdb"
   retention_days: 30
   min_free_disk_space_gb: 1
   max_memory_mb: 128
   write_buffer_size: 512
   write_buffer_flush_interval: 5
 EOF
+    else
+        # 理论上不会执行到这里，因为前面已判断未启用，但加一层保险
+        print_warn "配置中已存在 tsdb 项，但未被检测启用，可能是格式问题，请手动检查。"
     fi
 
-    $compose -f "$BASE/docker-compose.yml" up -d 2>/dev/null || {
-        log "启动失败"
-        return 1
-    }
-
-    sleep 5
-
-    if ! cd "$BASE" && $compose ps | grep -q "Up"; then
-        log "TSDB启动失败"
-        return 1
+    # 重启服务（允许失败）
+    if [[ -d "$BASE" ]]; then
+        cd "$BASE"
+        $compose up -d 2>/dev/null || print_warn "启动容器失败，请手动检查"
     fi
 
-    log "TSDB已启用"
+    print_info "▶ TSDB 开启成功！"
 }
 
-# =============================================================================
-# UI层（唯一入口，修复你之前的4命令问题）
-# =============================================================================
+# ---------- 菜单 ----------
 menu() {
     clear
-
     echo "================================"
-    echo " Nezha Toolbox Final Edition"
+    echo "       Nezha Toolbox"
     echo "================================"
 
     if nezha_installed; then
@@ -179,60 +249,45 @@ menu() {
         echo " Nezha : 未安装"
     fi
 
-    case "$(get_tsdb_state)" in
-        ENABLED)
-            echo " TSDB  : 已开启（运行中）"
-            ;;
-        CONFIG_ONLY)
-            echo " TSDB  : 已配置（未运行）"
-            ;;
-        DISABLED)
-            echo " TSDB  : 未开启"
-            ;;
-        UNKNOWN)
-            echo " TSDB  : 未检测"
-            ;;
-    esac
+    if tsdb_enabled; then
+        echo " TSDB  : 已开启"
+    else
+        echo " TSDB  : 未开启"
+    fi
 
     echo "================================"
-    echo "1 安装"
-    echo "2 备份"
-    echo "3 恢复"
-    echo "4 TSDB"
-    echo "0 退出"
+    echo " 1) 安装"
+    echo " 2) 备份"
+    echo " 3) 恢复"
+    echo " 4) 开启 TSDB"
+    echo " 0) 退出"
     echo "================================"
 
-    local c
-    c=$(safe_input "选择: ")
+    local choice
+    choice=$(safe_input "选择 [0-4]: ")
 
-    case "$c" in
-        1)
-            bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh)
-            ;;
-        2)
-            do_backup
-            ;;
-        3)
-            do_restore
-            ;;
-        4)
-            enable_tsdb
-            ;;
-        0)
-            exit 0
-            ;;
-        *)
-            log "无效选项"
-            ;;
+    case "$choice" in
+        1) install_nezha ;;
+        2) do_backup ;;
+        3) do_restore ;;
+        4) enable_tsdb ;;
+        0) print_info "退出脚本。"; exit 0 ;;
+        *) print_warn "无效选项，请重新选择。" ;;
     esac
 
     echo ""
-    read -r -p "回车返回菜单..." dummy
+    read -r -p "按回车继续..." _ || true
 }
 
-# =============================================================================
-# 主循环（关键修复：避免你之前“4 command not found”问题）
-# =============================================================================
-while true; do
-    menu
-done
+# ---------- 主流程 ----------
+main() {
+    check_root
+    check_deps
+    # 可选：捕获错误行号（调试用）
+    trap 'print_error "脚本在第 $LINENO 行发生错误，退出。"' ERR
+    while true; do
+        menu
+    done
+}
+
+main "$@"
