@@ -86,15 +86,8 @@ tsdb_enabled() {
 
 # ---------- 核心功能函数 ----------
 
-# 安装 Nezha
+# 安装 Nezha（不询问，直接执行）
 install_nezha() {
-    if nezha_installed; then
-        print_warn "检测到已有安装目录 $BASE"
-        if ! confirm "是否继续执行官方安装脚本（可能覆盖配置）"; then
-            print_info "已取消安装。"
-            return 0
-        fi
-    fi
     print_info "正在调用官方脚本安装 Nezha..."
     bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh)
     print_info "安装完成。"
@@ -223,7 +216,6 @@ tsdb:
   write_buffer_flush_interval: 5
 EOF
     else
-        # 理论上不会执行到这里，因为前面已判断未启用，但加一层保险
         print_warn "配置中已存在 tsdb 项，但未被检测启用，可能是格式问题，请手动检查。"
     fi
 
@@ -259,7 +251,7 @@ menu() {
     echo " 1) 安装"
     echo " 2) 备份"
     echo " 3) 恢复"
-    echo " 4) 开启 TSDB"
+    echo " 4) TSDB"
     echo " 0) 退出"
     echo "================================"
 
