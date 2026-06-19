@@ -1,94 +1,114 @@
 #!/bin/bash
 # =============================================================================
-# Nezha Toolbox（稳定交互终极版）
-# - 无 tty 崩溃
-# - curl | bash 兼容
-# - menu 不阻塞
+# Nezha Toolbox Enterprise Edition
+# 企业级安全版（TSDB / Backup / Restore / 安全门禁 / 日志审计）
 # =============================================================================
 
 set -euo pipefail
 
+# =========================
+# 全局路径
+# =========================
+BASE="/opt/nezha/dashboard"
+CONFIG="$BASE/data/config.yaml"
+DB="$BASE/data/sqlite.db"
+TSDB_DIR="$BASE/data/tsdb"
+
+LOG_FILE="/var/log/nezha-toolbox.log"
+
+# =========================
+# 日志系统（审计级）
+# =========================
 log() {
-    echo "[$(date '+%F %T')] $*"
+    local msg="[$(date '+%F %T')] $*"
+    echo "$msg"
+    echo "$msg" >> "$LOG_FILE"
 }
 
 # =========================
-# 输入统一处理（终极版）
+# 安全输入（企业级）
 # =========================
-safe_read() {
+safe_input() {
     local prompt="$1"
-    local var
 
-    # 优先使用 tty，否则使用 stdin
     if [ -t 0 ]; then
-        read -r -p "$prompt" var
+        read -r -p "$prompt" input
     else
-        read -r -p "$prompt" var < /dev/tty 2>/dev/null || {
-            echo "非交互环境，无法输入"
+        read -r input < /dev/tty 2>/dev/null || {
+            log "非交互环境，终止"
             exit 1
         }
     fi
 
-    echo "$var"
+    echo "$input"
 }
 
-# =========================
-# 强制确认（仅 Y）
-# =========================
 confirm_y() {
     local input
-    input=$(safe_read "$1 (仅 Y 继续): ")
+    input=$(safe_input "$1 (仅 Y 允许执行): ")
 
     case "$input" in
         Y) return 0 ;;
-        *) echo "已取消"; return 1 ;;
+        *) log "用户取消操作"; return 1 ;;
     esac
 }
 
 # =========================
-# docker compose
+# 前置检查（企业级门禁）
 # =========================
-detect_compose_cmd() {
-    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+require_env() {
+    if [ ! -d "$BASE" ]; then
+        log "错误：未检测到 Nezha 安装目录"
+        return 1
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        log "错误：docker 未安装"
+        return 1
+    fi
+
+    if ! docker compose version >/dev/null 2>&1 && ! command -v docker-compose >/dev/null 2>&1; then
+        log "错误：docker compose 不可用"
+        return 1
+    fi
+
+    return 0
+}
+
+detect_compose() {
+    if docker compose version >/dev/null 2>&1; then
         echo "docker compose"
-    elif command -v docker-compose >/dev/null 2>&1; then
-        echo "docker-compose"
     else
-        echo ""
+        echo "docker-compose"
     fi
 }
 
 # =========================
-# TSDB检测（稳定版）
+# TSDB状态检测（真实可靠）
 # =========================
-detect_tsdb() {
-    local CONFIG="/opt/nezha/dashboard/data/config.yaml"
-    local TSDB_DIR="/opt/nezha/dashboard/data/tsdb"
-
-    grep -q '^tsdb:' "$CONFIG" 2>/dev/null && return 0
-    [ -d "$TSDB_DIR" ] && return 0
-
-    return 1
+tsdb_status() {
+    if grep -q '^tsdb:' "$CONFIG" 2>/dev/null; then
+        echo "ON"
+    else
+        echo "OFF"
+    fi
 }
 
 # =========================
-# TSDB回滚
+# 企业级回滚系统
 # =========================
 rollback_tsdb() {
-    local CONFIG="$1"
-    local DB="$2"
-    local TIME="$3"
-    local DIR="$4"
-    local CMD="$5"
+    local TIME="$1"
+    local CMD="$2"
 
-    log "回滚TSDB..."
+    log "执行企业级回滚"
 
     $CMD down 2>/dev/null || true
 
     [ -f "${CONFIG}.bak.${TIME}" ] && cp -a "${CONFIG}.bak.${TIME}" "$CONFIG"
     [ -f "${DB}.bak.${TIME}" ] && cp -a "${DB}.bak.${TIME}" "$DB"
 
-    rm -rf "$DIR/data/tsdb" 2>/dev/null || true
+    rm -rf "$TSDB_DIR" 2>/dev/null || true
 
     $CMD up -d 2>/dev/null || true
 
@@ -96,43 +116,34 @@ rollback_tsdb() {
 }
 
 # =========================
-# TSDB开启（生产稳定版）
+# TSDB开启（企业级）
 # =========================
 enable_tsdb() {
-    local DIR="/opt/nezha/dashboard"
-    local CONFIG="$DIR/data/config.yaml"
-    local DB="$DIR/data/sqlite.db"
-    local TSDB_DIR="$DIR/data/tsdb"
-    local TIME
-    TIME=$(date +%F_%H-%M-%S)
+    require_env || return 1
 
     local CMD
-    CMD=$(detect_compose_cmd)
+    CMD=$(detect_compose)
 
-    if [ ! -d "$DIR" ] || [ -z "$CMD" ]; then
-        log "环境异常"
-        return 1
-    fi
-
-    if detect_tsdb; then
+    if [ "$(tsdb_status)" = "ON" ]; then
         log "TSDB已开启"
         return 0
     fi
 
-    if ! confirm_y "开启TSDB（会修改数据并重启服务）"; then
+    if ! confirm_y "开启TSDB（涉及数据变更+服务重启）"; then
         return 0
     fi
 
-    cd "$DIR"
+    local TIME
+    TIME=$(date +%F_%H-%M-%S)
 
-    log "备份配置"
+    log "创建快照"
     cp -a "$CONFIG" "${CONFIG}.bak.${TIME}" 2>/dev/null || true
     cp -a "$DB" "${DB}.bak.${TIME}" 2>/dev/null || true
 
     log "停止服务"
     $CMD down 2>/dev/null || true
 
-    log "清理历史"
+    log "清理历史数据"
     sqlite3 "$DB" "DELETE FROM service_histories; VACUUM;" 2>/dev/null || true
 
     log "写入TSDB配置"
@@ -141,7 +152,7 @@ enable_tsdb() {
         grep -v '^tsdb:' "$CONFIG" 2>/dev/null || true
         echo ""
         echo "tsdb:"
-        echo "  data_path: \"/opt/nezha/dashboard/data/tsdb\""
+        echo "  data_path: \"$TSDB_DIR\""
         echo "  retention_days: 30"
         echo "  min_free_disk_space_gb: 1"
         echo "  max_memory_mb: 128"
@@ -156,17 +167,18 @@ enable_tsdb() {
 
     sleep 10
 
-    log "验证"
-
+    # =========================
+    # 企业级验证（双保险）
+    # =========================
     if [ ! -d "$TSDB_DIR" ]; then
-        log "失败：TSDB未生成"
-        rollback_tsdb "$CONFIG" "$DB" "$TIME" "$DIR" "$CMD"
+        log "TSDB未生成 → 回滚"
+        rollback_tsdb "$TIME" "$CMD"
         return 1
     fi
 
     if ! $CMD ps 2>/dev/null | grep -q "Up"; then
-        log "失败：服务异常"
-        rollback_tsdb "$CONFIG" "$DB" "$TIME" "$DIR" "$CMD"
+        log "容器异常 → 回滚"
+        rollback_tsdb "$TIME" "$CMD"
         return 1
     fi
 
@@ -174,74 +186,87 @@ enable_tsdb() {
 }
 
 # =========================
-# 备份
+# 备份（企业级安全）
 # =========================
-do_backup() {
-    local BACKUP="/root/backup.tar.gz"
+backup() {
+    require_env || return 1
+
+    if ! confirm_y "执行备份（将停止服务）"; then
+        return 0
+    fi
+
     local CMD
-    CMD=$(detect_compose_cmd)
+    CMD=$(detect_compose)
 
     systemctl stop nginx 2>/dev/null || true
-    [ -d /opt/nezha/dashboard ] && cd /opt/nezha/dashboard && $CMD down || true
+    cd "$BASE" && $CMD down 2>/dev/null || true
 
-    tar -czf "$BACKUP" \
+    tar -czf "/root/nezha_backup_$(date +%F_%H-%M-%S).tar.gz" \
         --exclude="data/tsdb" \
         /opt/nezha /etc/nginx /root/ssl 2>/dev/null || true
 
-    [ -d /opt/nezha/dashboard ] && cd /opt/nezha/dashboard && $CMD up -d || true
+    cd "$BASE" && $CMD up -d 2>/dev/null || true
     systemctl start nginx 2>/dev/null || true
 
     log "备份完成"
 }
 
 # =========================
-# 恢复
+# 恢复（企业级安全）
 # =========================
-do_restore() {
-    local BACKUP="/root/backup.tar.gz"
-    local CMD
-    CMD=$(detect_compose_cmd)
+restore() {
+    require_env || return 1
 
-    [ -f "$BACKUP" ] || return 1
+    local file
+    file=$(ls /root/nezha_backup_*.tar.gz 2>/dev/null | tail -n 1 || true)
 
-    if ! confirm_y "恢复将覆盖数据"; then
+    if [ -z "$file" ]; then
+        log "未找到备份文件"
+        return 1
+    fi
+
+    if ! confirm_y "恢复将覆盖全部数据"; then
         return 0
     fi
 
+    local CMD
+    CMD=$(detect_compose)
+
     systemctl stop nginx 2>/dev/null || true
-    [ -d /opt/nezha/dashboard ] && cd /opt/nezha/dashboard && $CMD down || true
+    cd "$BASE" && $CMD down 2>/dev/null || true
 
-    tar -xzf "$BACKUP" -C / 2>/dev/null || true
+    tar -xzf "$file" -C / 2>/dev/null || true
 
-    [ -d /opt/nezha/dashboard ] && cd /opt/nezha/dashboard && $CMD up -d || true
+    cd "$BASE" && $CMD up -d 2>/dev/null || true
     systemctl start nginx 2>/dev/null || true
 
     log "恢复完成"
 }
 
 # =========================
-# 菜单（终极稳定版）
+# 菜单系统（企业级安全）
 # =========================
 menu() {
-    echo "===================="
-    echo "Nezha Toolbox"
-    echo "===================="
+    echo "=========================="
+    echo "Nezha Enterprise Toolbox"
+    echo "=========================="
     echo "1 安装"
     echo "2 备份"
     echo "3 恢复"
-    echo "4 开启TSDB"
+    echo "4 TSDB开启"
     echo "0 退出"
+    echo "=========================="
 
     local c
-    c=$(safe_read "选择: ")
+    c=$(safe_input "选择: ")
 
     case "$c" in
         1) bash <(curl -fsSL https://raw.githubusercontent.com/nezhahq/scripts/refs/heads/main/install.sh) ;;
-        2) do_backup ;;
-        3) do_restore ;;
+        2) backup ;;
+        3) restore ;;
         4) enable_tsdb ;;
         0) exit 0 ;;
-        *) echo "无效选项" ;;
+        *) log "无效选项" ;;
     esac
 }
 
