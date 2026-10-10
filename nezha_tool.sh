@@ -600,7 +600,7 @@ detect_pkg_mgr() {
 # 配置 nginx 官方源（nginx.org）
 # 返回 0=已配置官方源，1=配置失败（调用方回退发行版自带源）
 remove_nginx_official_repo() {
-    rm -f /etc/apt/sources.list.d/nginx.list /etc/yum.repos.d/nginx.repo
+    rm -f /etc/apt/sources.list.d/nginx.list /etc/yum.repos.d/nginx.repo /etc/apk/keys/nginx_signing.rsa.pub
     if [[ -f /etc/apk/repositories ]]; then
         grep -v 'nginx.org/packages/alpine' /etc/apk/repositories > /tmp/apk.repositories.tmp 2>/dev/null \
             && mv /tmp/apk.repositories.tmp /etc/apk/repositories || true
@@ -689,16 +689,24 @@ EOF
                 print_warn "无法识别 Alpine 版本，跳过官方源配置。"
                 return 1
             fi
-            arepo="http://nginx.org/packages/alpine/v${aver}/main"
-            if ! grep -qF "$arepo" /etc/apk/repositories 2>/dev/null; then
-                echo "$arepo" >> /etc/apk/repositories
+            arepo="https://nginx.org/packages/alpine/v${aver}/main"
+            # apk 只认 X.509/RSA 公钥（.rsa.pub），PGP 格式的 nginx_signing.key 会被拒为 UNTRUSTED
+            if ! curl -fsSL -o /etc/apk/keys/nginx_signing.rsa.pub https://nginx.org/keys/nginx_signing.rsa.pub; then
+                print_warn "官方签名键下载失败，跳过官方源配置。"
+                rm -f /etc/apk/keys/nginx_signing.rsa.pub
+                return 1
             fi
-            if apk update >/dev/null 2>&1; then
+            # 按官方文档使用 @nginx 标签仓库，安装时用 nginx@nginx 指定来源，避免被发行版同名高版本覆盖
+            if ! grep -qF "@nginx $arepo" /etc/apk/repositories 2>/dev/null; then
+                printf '@nginx %s\n' "$arepo" >> /etc/apk/repositories
+            fi
+            if apk update >/dev/null 2>&1 && apk policy nginx 2>/dev/null | grep -qF "$arepo"; then
                 print_info "nginx 官方源已配置: $arepo"
                 return 0
             fi
-            print_warn "apk update 失败，移除官方源回退发行版源。"
+            print_warn "官方源启用失败（update 或源不可见），移除回退发行版源。"
             remove_nginx_official_repo
+            apk update >/dev/null 2>&1 || true
             return 1
             ;;
         *)
@@ -708,12 +716,20 @@ EOF
 }
 
 # 执行一次 nginx 安装（mgr 由 install_migrate_deps 定义，bash 动态作用域可见）
+# $1=1 时（apk）用 @nginx 标签强制从官方源安装
 try_install_nginx() {
+    local use_official="${1:-0}"
     case "$mgr" in
         apt)      apt-get install -y nginx ;;
         dnf)      dnf install -y nginx ;;
         yum)      yum install -y nginx ;;
-        apk)      apk add --no-cache nginx ;;
+        apk)
+            if [[ "$use_official" == "1" ]]; then
+                apk add --no-cache nginx@nginx
+            else
+                apk add --no-cache nginx
+            fi
+            ;;
         *)        return 1 ;;
     esac
 }
@@ -728,14 +744,14 @@ install_nginx() {
     if setup_nginx_official_repo "$mgr"; then
         official_ok=1
     fi
-    if try_install_nginx; then
+    if try_install_nginx "$official_ok"; then
         print_info "nginx 安装完成（$(nginx -v 2>&1 | head -1)），来源: $([[ $official_ok -eq 1 ]] && echo 官方源 || echo 发行版源)。"
         return 0
     fi
     if [[ $official_ok -eq 1 ]]; then
         print_warn "官方源安装 nginx 失败，回退发行版自带源重试..."
         remove_nginx_official_repo
-        if try_install_nginx; then
+        if try_install_nginx 0; then
             print_info "nginx 安装完成（发行版源）。"
             return 0
         fi
