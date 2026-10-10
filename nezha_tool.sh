@@ -84,19 +84,44 @@ check_root() {
     fi
 }
 
+# 检测依赖，缺失则自动安装，安装后复检仍缺失才报错退出
 check_deps() {
     local deps=("docker" "tar" "sqlite3" "curl")
-    local missing=()
+    local missing=() cmd
     for cmd in "${deps[@]}"; do
         if ! command -v "$cmd" &>/dev/null; then
             missing+=("$cmd")
         fi
     done
+    local compose_missing=0
+    if ! docker compose version &>/dev/null && ! command -v docker-compose &>/dev/null; then
+        compose_missing=1
+    fi
     if ! command -v systemctl &>/dev/null; then
         print_warn "未检测到 systemctl，nginx 启停将跳过。"
     fi
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        print_error "缺少以下依赖: ${missing[*]}，请安装后再试。"
+    if [[ ${#missing[@]} -gt 0 || $compose_missing -eq 1 ]]; then
+        if [[ ${#missing[@]} -gt 0 ]]; then
+            print_warn "检测到缺失依赖: ${missing[*]}"
+        fi
+        if [[ $compose_missing -eq 1 ]]; then
+            print_warn "检测到 docker compose 缺失"
+        fi
+        print_info "正在自动安装缺失依赖..."
+        install_common_deps || true
+    fi
+    # 复检
+    local still=()
+    for cmd in "${deps[@]}"; do
+        command -v "$cmd" &>/dev/null || still+=("$cmd")
+    done
+    if [[ ${#still[@]} -eq 0 ]]; then
+        if ! docker compose version &>/dev/null && ! command -v docker-compose &>/dev/null; then
+            still+=("docker compose")
+        fi
+    fi
+    if [[ ${#still[@]} -gt 0 ]]; then
+        print_error "以下依赖自动安装后仍缺失: ${still[*]}，请手动安装后再试。"
         exit 1
     fi
 }
@@ -760,71 +785,95 @@ install_nginx() {
     return 1
 }
 
-# 在新 VPS 上安装迁移所需依赖：docker + docker compose + nginx（官方源优先）+ sqlite3 + curl + tar
-install_migrate_deps() {
+# 按包管理器安装包（自动映射逻辑包名到发行版包名：sqlite3 → sqlite/sqlite3）
+pkg_install() {
+    local mgr="$1"; shift
+    local pkgs=() p
+    for p in "$@"; do
+        case "$p" in
+            sqlite3)
+                case "$mgr" in
+                    apt|apk) pkgs+=("sqlite3") ;;
+                    *)       pkgs+=("sqlite") ;;
+                esac
+                ;;
+            compose-plugin)
+                case "$mgr" in
+                    apk) pkgs+=("docker-cli-compose") ;;
+                    *)   pkgs+=("docker-compose-plugin") ;;
+                esac
+                ;;
+            *) pkgs+=("$p") ;;
+        esac
+    done
+    case "$mgr" in
+        apt)  DEBIAN_FRONTEND=noninteractive apt-get install -y "${pkgs[@]}" ;;
+        dnf)  dnf install -y "${pkgs[@]}" ;;
+        yum)  yum install -y "${pkgs[@]}" ;;
+        apk)  apk add --no-cache "${pkgs[@]}" ;;
+        *)    return 1 ;;
+    esac
+}
+
+# 通用依赖安装：只装缺失的（docker 走官方脚本，其余走包管理器；compose 插件兜底）
+# 被 check_deps（各子命令通用）和 install_migrate_deps（迁移导入）共用
+install_common_deps() {
     local mgr
     mgr=$(detect_pkg_mgr)
-    print_info "检测到包管理器: $mgr，开始安装依赖（nginx / sqlite3 / curl / tar / ca-certificates）..."
+    if [[ "$mgr" == "unknown" ]]; then
+        print_error "无法识别的发行版，请手动安装 docker、docker compose、sqlite3、curl、tar 后重试。"
+        return 1
+    fi
 
-    case "$mgr" in
-        apt)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || print_warn "apt-get update 失败，继续尝试安装..."
-            apt-get install -y sqlite3 curl tar ca-certificates || {
-                print_error "依赖安装失败，请检查网络或手动安装。"
-                return 1
-            }
-            ;;
-        dnf)
-            dnf install -y sqlite curl tar ca-certificates || {
-                print_error "依赖安装失败，请检查网络或手动安装。"
-                return 1
-            }
-            ;;
-        yum)
-            yum install -y epel-release 2>/dev/null || true
-            yum install -y sqlite curl tar ca-certificates || {
-                print_error "依赖安装失败，请检查网络或手动安装。"
-                return 1
-            }
-            ;;
-        apk)
-            apk add --no-cache sqlite curl tar ca-certificates || {
-                print_error "依赖安装失败，请检查网络或手动安装。"
-                return 1
-            }
-            ;;
-        *)
-            print_error "无法识别的发行版，请手动安装 docker、docker compose、nginx、sqlite3、curl、tar 后重试。"
-            return 1
-            ;;
-    esac
-
-    # nginx：优先官方源（nginx.org）
-    install_nginx || return 1
-
+    # docker：官方脚本安装
     if ! command -v docker &>/dev/null; then
         print_info "Docker 未安装，使用官方脚本安装（https://get.docker.com）..."
+        pkg_install "$mgr" ca-certificates curl 2>/dev/null || true
         if ! curl -fsSL https://get.docker.com | sh; then
             print_error "Docker 安装失败。"
             return 1
         fi
     fi
-    if command -v systemctl &>/dev/null; then
-        systemctl enable docker 2>/dev/null || print_warn "docker 开机自启设置失败（可忽略）"
-        systemctl start docker 2>/dev/null || print_warn "docker 启动失败，请手动检查"
+
+    # 其余通用包：仅安装缺失项
+    local want=()
+    command -v tar &>/dev/null     || want+=(tar)
+    command -v sqlite3 &>/dev/null || want+=(sqlite3)
+    command -v curl &>/dev/null    || want+=(curl)
+    if [[ ${#want[@]} -gt 0 ]]; then
+        print_info "自动安装缺失依赖: ${want[*]}（包管理器: $mgr）"
+        case "$mgr" in
+            apt) export DEBIAN_FRONTEND=noninteractive; apt-get update -y || print_warn "apt-get update 失败，继续尝试安装..." ;;
+            yum) yum install -y epel-release 2>/dev/null || true ;;
+        esac
+        if ! pkg_install "$mgr" "${want[@]}"; then
+            print_error "依赖安装失败: ${want[*]}，请检查网络或手动安装。"
+            return 1
+        fi
     fi
 
     # compose 插件兜底
     if ! docker compose version &>/dev/null && ! command -v docker-compose &>/dev/null; then
         print_info "安装 docker compose 插件..."
-        case "$mgr" in
-            apt)   apt-get install -y docker-compose-plugin 2>/dev/null || print_warn "compose 插件安装失败，请手动安装" ;;
-            dnf)   dnf install -y docker-compose-plugin 2>/dev/null || print_warn "compose 插件安装失败，请手动安装" ;;
-            yum)   yum install -y docker-compose-plugin 2>/dev/null || print_warn "compose 插件安装失败，请手动安装" ;;
-            *)     print_warn "请手动安装 docker compose（https://docs.docker.com/compose/install/）" ;;
-        esac
+        pkg_install "$mgr" compose-plugin 2>/dev/null || print_warn "compose 插件安装失败，请手动安装（https://docs.docker.com/compose/install/）"
     fi
+
+    if command -v systemctl &>/dev/null; then
+        systemctl enable docker 2>/dev/null || print_warn "docker 开机自启设置失败（可忽略）"
+        systemctl start docker 2>/dev/null || print_warn "docker 启动失败，请手动检查"
+    fi
+}
+
+# 迁移导入用：全套依赖 = 通用依赖 + nginx（官方源优先）
+install_migrate_deps() {
+    local mgr
+    mgr=$(detect_pkg_mgr)
+    print_info "检测到包管理器: $mgr，开始安装依赖（docker / compose / nginx / sqlite3 / curl / tar）..."
+
+    install_common_deps || return 1
+
+    # nginx：优先官方源（nginx.org），失败回退发行版源
+    install_nginx || return 1
 }
 
 # 迁移导出：在旧 VPS 执行。生成环境清单 + 复用 do_backup 打包全部数据。
