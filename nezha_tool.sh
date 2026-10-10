@@ -815,8 +815,45 @@ pkg_install() {
     esac
 }
 
+# 修复 apt 源健康：禁用"确定性损坏"的源（无 Release 文件等），避免一个失效第三方源
+# 拖垮 apt-get update，进而阻断 docker 等依赖安装。被禁用的文件保留为 *.disabled-by-nezha-toolbox 可恢复。
+fix_broken_apt_sources() {
+    local log=/tmp/nezha-apt-update.log tries=3 repo url files file disabled_any
+    while (( tries-- > 0 )); do
+        if apt-get update -qq >"$log" 2>&1; then
+            rm -f "$log"
+            return 0
+        fi
+        # 只处理 "The repository 'xxx' ..." 这类确定性源损坏；网络类瞬时错误不乱动
+        repo=$(grep -oE "The repository '[^']+'" "$log" 2>/dev/null | sed "s/The repository '//;s/'$//" | awk '{print $1}' | sort -u || true)
+        if [[ -z "$repo" ]]; then
+            print_warn "apt-get update 仍失败（非源配置问题），继续尝试安装..."
+            rm -f "$log"
+            return 0
+        fi
+        disabled_any=0
+        for url in $repo; do
+            files=$(grep -rlF "$url" /etc/apt/sources.list.d /etc/apt/sources.list 2>/dev/null || true)
+            for file in $files; do
+                if [[ -f "$file" ]]; then
+                    print_warn "禁用失效 apt 源: $file（匹配 $url，已改名为 *.disabled-by-nezha-toolbox 可恢复）"
+                    mv -f "$file" "${file}.disabled-by-nezha-toolbox" && disabled_any=1
+                fi
+            done
+        done
+        if [[ $disabled_any -eq 0 ]]; then
+            print_warn "无法定位失效源文件，继续尝试安装..."
+            rm -f "$log"
+            return 0
+        fi
+    done
+    rm -f "$log"
+    return 0
+}
+
 # 通用依赖安装：只装缺失的（docker 走官方脚本，其余走包管理器；compose 插件兜底）
 # 被 check_deps（各子命令通用）和 install_migrate_deps（迁移导入）共用
+# 单项失败不中止，最后汇总返回非零（由 check_deps 复检兜底）
 install_common_deps() {
     local mgr
     mgr=$(detect_pkg_mgr)
@@ -824,14 +861,20 @@ install_common_deps() {
         print_error "无法识别的发行版，请手动安装 docker、docker compose、sqlite3、curl、tar 后重试。"
         return 1
     fi
+    local errors=()
 
-    # docker：官方脚本安装
+    # apt：先修源，防止失效第三方源阻断后续所有安装
+    if [[ "$mgr" == "apt" ]]; then
+        fix_broken_apt_sources
+    fi
+
+    # docker：官方脚本安装（失败继续装其余依赖，最后汇总）
     if ! command -v docker &>/dev/null; then
         print_info "Docker 未安装，使用官方脚本安装（https://get.docker.com）..."
         pkg_install "$mgr" ca-certificates curl 2>/dev/null || true
         if ! curl -fsSL https://get.docker.com | sh; then
             print_error "Docker 安装失败。"
-            return 1
+            errors+=("docker")
         fi
     fi
 
@@ -843,12 +886,12 @@ install_common_deps() {
     if [[ ${#want[@]} -gt 0 ]]; then
         print_info "自动安装缺失依赖: ${want[*]}（包管理器: $mgr）"
         case "$mgr" in
-            apt) export DEBIAN_FRONTEND=noninteractive; apt-get update -y || print_warn "apt-get update 失败，继续尝试安装..." ;;
+            apt) export DEBIAN_FRONTEND=noninteractive ;;
             yum) yum install -y epel-release 2>/dev/null || true ;;
         esac
         if ! pkg_install "$mgr" "${want[@]}"; then
             print_error "依赖安装失败: ${want[*]}，请检查网络或手动安装。"
-            return 1
+            errors+=("${want[@]}")
         fi
     fi
 
@@ -862,6 +905,12 @@ install_common_deps() {
         systemctl enable docker 2>/dev/null || print_warn "docker 开机自启设置失败（可忽略）"
         systemctl start docker 2>/dev/null || print_warn "docker 启动失败，请手动检查"
     fi
+
+    if [[ ${#errors[@]} -gt 0 ]]; then
+        print_error "以下组件安装失败: ${errors[*]}"
+        return 1
+    fi
+    return 0
 }
 
 # 迁移导入用：全套依赖 = 通用依赖 + nginx（官方源优先）
